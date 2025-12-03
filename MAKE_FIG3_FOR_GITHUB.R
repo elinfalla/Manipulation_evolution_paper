@@ -3,7 +3,7 @@
 #####################################################################
 
 ## This script runs code to produce and save a pdf of Figure 3 to the current 
-## directory, from the paper 
+## directory
 
 rm(list = ls())
 
@@ -14,9 +14,6 @@ library(gridExtra)
 library(numDeriv)
 library(cowplot)
 library(latex2exp)
-
-# source("code/FUNCTIONS.R")
-# source("code/PARMS.R")
 
 #### FUNCTIONS ####
 transient_colonising_ode <- function(times, y, parms, death_linked_v = F) {
@@ -284,7 +281,17 @@ find_equilibria_over_v <- function(parms,
   return(results_df)
 }
 
-### INVASION FITNESS FUNCTIONS - for one-year (equilibrium) invasion fitness
+set_text_size <- function(plot, size=15) {
+  if (inherits(plot, "ggplot")) {
+    plot + theme(text = element_text(size = size))
+  } else {
+    plot  # leave grobs (e.g. legend) unchanged
+  }
+}
+
+
+### INVASION FITNESS FUNCTIONS
+# for one-year (equilibrium) invasion fitness
 mutant_combined_ode <- function(y, parms, resident_eq) {
   
   # mutant part of 2 strain combined model with mutant and resident virus strains (set up for 1 timepoint only),
@@ -343,8 +350,6 @@ mutant_combined_ode <- function(y, parms, resident_eq) {
 }
 
 calculate_invasion_fitness <- function(v_r, v_m, parms, tmax = "equilibrium", silent=T) {
-  ## by default, will do usual invasion fitness which is at resident equilibrium,
-  ## but by setting tmax to a number you can calculate the invasion fitness at that point (IT WONT MEAN ANYTHING THOUGH - SEE SEASONAL INV FITNESS)
   
   if (!silent) { print(paste("v_r:", v_r, "v_m:", v_m)) }
   
@@ -475,13 +480,164 @@ pairwise_invasibility_plot <- function(parms, type = c("one_year", "seasonal"), 
   return(out) # else return the data
 }
 
-set_text_size <- function(plot, size=15) {
-  if (inherits(plot, "ggplot")) {
-    plot + theme(text = element_text(size = size))
-  } else {
-    plot  # leave grobs (e.g. legend) unchanged
-  }
+# for seasonal invasion fitness - for reference, not used in this figure
+mutant_ode_res_background <- function(time, y, parms, Z_last, I_interp, Xt_interp, Xc_interp, Zt_interp, Zc_interp) {
+  with(as.list(c(y, parms)), {
+    S <- H - I_interp(time)
+    X_c <- Xc_interp(time)
+    X_t <- Xt_interp(time)
+    
+    # v and I for res and mutant
+    v_vals <- c(v_r, v_m)
+    I_i <- c(I_interp(time), I_m)
+    
+    # proportion of mutant immigrants given by Z_last - proportion of Z emigration last season
+    Zt_last_m <- Z_last[["Zt"]]
+    Zc_last_m <- Z_last[["Zc"]]
+    
+    H_hat <- S + sum(v_vals*I_i)
+    
+    # aphid flight rates (c = colonising, t = transient)
+    phi_t <- 1 / (k + t)
+    phi_c <- H_hat / 
+      (omega*eta*(S + epsilon*sum(v_vals*I_i)) + (t + k)*H_hat)
+    
+    # aphid infectivity loss rates (c = colonising, t = transient)
+    tau_t <- (1 - q)*phi_t*rho*(S + (1 - a)*sum(v_vals*I_i)) / H_hat
+    tau_c <- (1 - q_c)*phi_c*
+      (S*(rho + (1 - rho)*omega) + 
+         sum(v_vals*I_i)*(rho*(1 - a*(1 - epsilon*omega)) + (1 - rho)*epsilon*omega)) / H_hat
+    
+    # PLANTS EQUATION
+    plant_death_m <- gamma*(1 + mu*(v_m - 1)^2)
+    inoculation_m <- b*(1 / (1 + mu2*(v_m - 1)^2))
+    dI_m <- ((1 - q)*phi_t*Zt_m + (1 - q_c)*phi_c*Zc_m)*inoculation_m*S/H_hat - plant_death_m*I_m
+    
+    # TRANSIENT APHID EQUATIONS
+    dZt_m <- pi*lambda*psi*Zt_last_m + # immigration
+      (1 - q)*phi_t*a*X_t*v_m*I_m / H_hat - # acquisition
+      tau_t*Zt_m - # infectivity loss
+      q*phi_t*Zt_m # emigration
+    
+    # COLONISING APHID EQUATIONS
+    dZc_m <- pi*lambda*(1 - psi)*Zc_last_m + # immigration 
+      (1 - q_c)*phi_c*X_c*a*(1 - epsilon*omega)*v_m*I_m / H_hat - # acquisition
+      tau_c*Zc_m - # infectivity loss
+      q_c*phi_c*Zc_m - # emigration
+      theta*Zc_m # death
+    
+    return(list(c(dI_m, dZt_m, dZc_m)))
+  })
 }
+
+run_years_mutant_res_background <- function(v_r, v_m, num_years, tmax, parms) {
+  
+  v_vals <- c(v_r, v_m)
+  num_states <- 2
+  out_df <- data.frame(year = rep(1:num_years, each = num_states),
+                       state = rep(c("Zt", "Zc"), times = num_years),
+                       tmax_val = NA,
+                       tmax_prop = NA) # proportion compared to resident value
+  
+  # initialise parms, times
+  times <- seq(0, tmax, length.out = 100)
+  
+  parms_res <- parms
+  parms_res[["v"]] <- v_r
+  
+  parms_mut <- c(parms, v_r = v_r, v_m = v_m)
+  #parms_mut[["pi"]] <- 0 # assume mutant appears in field
+  
+  # run epidemic of resident for tmax value
+  init_states_res <- c(I = 0, # invading scenario
+                       X_t = 0,
+                       Z_t = 0,
+                       X_c = 0,
+                       Z_c = 0)
+  res_out <- data.frame(ode(y = init_states_res,
+                            times = times,
+                            parms = parms_res,
+                            func = transient_colonising_ode))
+  res_endI <- res_out[res_out$time == tmax, "I"]
+  res_endZc <- res_out[res_out$time == tmax, "Z_c"]
+  res_endZt <- res_out[res_out$time == tmax, "Z_t"]
+  
+  # create interpolation function for S, Xt, and Xc for the resident strain
+  interp_Ifunc <- approxfun(x = res_out$time, y = res_out$I, rule = 2)
+  interp_Xtfunc <- approxfun(x = res_out$time, y = res_out$X_t, rule = 2)
+  interp_Xcfunc <- approxfun(x = res_out$time, y = res_out$X_c, rule = 2)
+  interp_Ztfunc <- approxfun(x = res_out$time, y = res_out$Z_t, rule = 2)
+  interp_Zcfunc <- approxfun(x = res_out$time, y = res_out$Z_c, rule = 2)
+  
+  init_mut_prop <- 1e-5
+  # Z_last <- c(Zt = init_mut / (init_mut + Zt_interp(time)),
+  #                  Zc = init_mut / (init_mut + Zc_interp(time)))
+  Z_last <- c(Zt = init_mut_prop, Zc = init_mut_prop) # so they're the same proportion
+  
+  for (yr in 1:num_years) {
+    run <- data.frame(ode(y = c(I_m = 0, Zt_m = 0, Zc_m = 0),
+                          times = seq(0, tmax, length.out = 100),
+                          parms = parms_mut,
+                          func = mutant_ode_res_background,
+                          Z_last = Z_last,
+                          I_interp = interp_Ifunc,
+                          Xt_interp = interp_Xtfunc,
+                          Xc_interp = interp_Xcfunc,
+                          Zt_interp = interp_Ztfunc,
+                          Zc_interp = interp_Zcfunc))
+    
+    endZ <- run[nrow(run),-c(1,2)]
+    endI <- run[nrow(run), "I_m"]
+    I_vals <- c(res_endI, endI)
+    H_hat_mut <- parms[["H"]] - res_endI + sum(v_vals*I_vals)
+    H_hat_res <- parms[["H"]] - res_endI + v_r*res_endI
+    
+    phi_mut <- H_hat_mut / (parms[["omega"]]*parms[["eta"]]*(parms[["H"]]-res_endI + parms[["epsilon"]]*sum(v_vals*I_vals)) + 
+                              (parms[["t"]] + parms[["k"]])*H_hat_mut)
+    phi_res <- H_hat_res / (parms[["omega"]]*parms[["eta"]]*(parms[["H"]]-res_endI + parms[["epsilon"]]*v_r*res_endI) + 
+                              (parms[["t"]] + parms[["k"]])*H_hat_res)
+    
+    Z_last <- c(Zt = endZ[["Zt_m"]] / (endZ[["Zt_m"]] + res_endZt),
+                #Zc = endZ[["Zc_m"]] / (endZ[["Zc_m"]] + interp_Zcfunc(tmax))#,
+                Zc = phi_mut*endZ[["Zc_m"]] / (phi_mut*endZ[["Zc_m"]] + phi_res*res_endZc)
+    )
+    out_df[((yr - 1)*num_states + 1):(yr*num_states), "tmax_prop"] <- Z_last
+    out_df[((yr - 1)*num_states + 1):(yr*num_states), "tmax_val"] <- unlist(endZ)
+    
+  }
+  return(out_df)
+}
+
+calculate_seasonal_invasion_fitness <- function(v_r, v_m, parms, tmax, lower_bound=1, upper_bound=3, plot_grad=F, silent=T) {
+  if (!silent) print(paste("v_r:", v_r, "v_m:", v_m))
+  
+  num_years <- 25
+  seasonal_out <- run_years_mutant_res_background(v_r = v_r, 
+                                                  v_m = v_m, 
+                                                  num_years = num_years, 
+                                                  tmax = tmax, 
+                                                  parms = parms)
+  if (plot_grad) { # plot gradient used as invasion fitness and boundaries
+    plot <- ggplot(seasonal_out %>% filter(year < 100), 
+                   aes(x = year, y = log(tmax_prop), col = state)) + 
+      geom_line() +
+      geom_vline(xintercept = lower_bound) +
+      geom_vline(xintercept = upper_bound)
+    grid.arrange(plot)
+  }
+  Zc_model <- lm(log(tmax_prop) ~ year, data = (seasonal_out %>% filter(year >= lower_bound &
+                                                                          year <= upper_bound &
+                                                                          state == "Zc")))
+  Zt_model <- lm(log(tmax_prop) ~ year, data = (seasonal_out %>% filter(year >= lower_bound &
+                                                                          year <= upper_bound & 
+                                                                          state == "Zt")))
+  Zc_gradient <- Zc_model$coefficients[["year"]]
+  Zt_gradient <- Zt_model$coefficients[["year"]]
+  
+  return(c(Zt_gradient, Zc_gradient))
+  
+}
+
 
 #### PARAMETERS AND INITIAL STATES ####
 
@@ -510,18 +666,6 @@ parms_default <- c(
   theta = 0.3, # colonising aphid death rate
   kappa = 25 # colonising aphid carrying capacity per plant
 )
-
-
-# parms_default <- parms
-# parms_default[["lambda"]] <- 3
-# parms_default[["sigma"]] <- 0.35
-# parms_default[["t"]] <- 0.0035
-# 
-# parms_fig1 <- parms_default
-# parms_fig1[["kappa"]] <- 25 
-
-
-# alternate was kappa=50, psi=0.6, sigma=0.34, lambda=3
 
 init_states <- c(I = 0,
                  X_t = 0,
@@ -642,26 +786,9 @@ Zem_eq_plot <- Ieq_plot + aes(y = Zc_em, lty = "colonising") +
 
 #### PANEL G - v versus R0 ####
 
-# parms_R0 <- parms_fig1
-
-
 v_R0_df <- calculate_R0_over_v(parms_default, seq(0.01, 5, length.out = 100))
 v_R0_points_df <- calculate_R0_over_v(parms_default,
                                       v_vals = v_vals)
-# v_R0_df <- data.frame()
-# for (v in seq(0.01, 5, length.out = 100)) {
-#   parms_R0[["v"]] <- v
-#   v_R0_df <- rbind(v_R0_df,
-#                    cbind(t(calculate_combi_R0(parms_R0, calc_parts = T)),
-#                          v = v))
-# }
-# v_R0_points_df <- data.frame()
-# for (v in c(1, 1.5, 3.5)) {
-#   parms_R0[["v"]] <- v
-#   v_R0_points_df <- rbind(v_R0_points_df,
-#                           cbind(t(calculate_combi_R0(parms_R0, calc_parts = T)),
-#                                 v = v))
-# }
 
 v_R0_plot <- ggplot(v_R0_df, aes(x = v, y = transient)) +
   geom_line(lty = 2) +
